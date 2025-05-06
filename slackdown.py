@@ -18,29 +18,91 @@ if not SLACK_TOKEN:
 
 HEADERS = {'Authorization': f'Bearer {SLACK_TOKEN}'}
 
+# Path for storing user data
+USER_DATA_PATH = Path(os.path.expanduser("~/.slackdown/users.json"))
+
 # Constants for JSON to Markdown conversion
 MAX_MSG_LENGTH = 2000
 JIRA_COMMENT_RE = re.compile(r"@?.+ commented on OH-\d+ .+")
 
 def check_response(resp):
     if not resp.get("ok"):
-        print("❌ Slack API error:", resp.get("error"))
-        raise Exception("Slack API error: " + str(resp.get("error")))
+        error = resp.get("error")
+        if error == "ratelimited":
+            retry_after = int(resp.get("retry_after", 1))
+            print(f"⏰ Rate limited by Slack API. Waiting {retry_after} seconds...")
+            time.sleep(retry_after)
+            return False
+        print("❌ Slack API error:", error)
+        raise Exception("Slack API error: " + str(error))
+    return True
 
-def fetch_user_map():
-    print("🔍 Fetching user list...")
+def save_users(user_map, metadata=None):
+    """Save user data to local file system."""
+    if metadata is None:
+        metadata = {}
+    
+    # Ensure directory exists
+    USER_DATA_PATH.parent.mkdir(exist_ok=True, parents=True)
+    
+    data = {
+        "users": user_map,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "metadata": metadata
+    }
+    
+    with open(USER_DATA_PATH, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    
+    print(f"💾 User data saved locally ({len(user_map)} users)")
+
+def load_users():
+    """Load user data from local file if available."""
+    try:
+        if USER_DATA_PATH.exists():
+            with open(USER_DATA_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                print(f"📂 Loaded {len(data['users'])} users from local cache")
+                print(f"   Cache timestamp: {data['timestamp']}")
+                return data['users'], data.get('metadata', {})
+    except Exception as e:
+        print(f"⚠️ Failed to load local user data: {e}")
+    
+    return None, None
+
+def fetch_user_map(force_refresh=False):
+    """Get users, using local cache if available unless force_refresh is True."""
+    if not force_refresh:
+        user_map, metadata = load_users()
+        if user_map:
+            print("ℹ️ Using cached user data. Use --refresh-users to fetch fresh data.")
+            return user_map
+    
+    print("🔍 Fetching users from Slack API...")
     user_map = {}
     cursor = None
     total_users = 0
+    metadata = {}
 
     while True:
         params = {'limit': 200}
         if cursor:
             params['cursor'] = cursor
 
-        res = requests.get("https://slack.com/api/users.list", headers=HEADERS, params=params)
-        data = res.json()
-        check_response(data)
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            res = requests.get("https://slack.com/api/users.list", headers=HEADERS, params=params)
+            data = res.json()
+            
+            if check_response(data):
+                break
+            
+            retry_count += 1
+            if retry_count >= max_retries:
+                print(f"❌ Failed after {max_retries} attempts to fetch users")
+                raise Exception("Maximum retries exceeded while fetching users")
 
         users = data.get("members", [])
         for user in users:
@@ -52,21 +114,38 @@ def fetch_user_map():
         cursor = data.get("response_metadata", {}).get("next_cursor")
         if not cursor:
             break
+        
+        # Respect rate limits - add small delay between pagination requests
+        time.sleep(0.5)
 
     if not user_map:
         print("⚠️ No users fetched. Check your token scopes (`users:read`).")
+    else:
+        # Save users to local cache
+        save_users(user_map, {"total_users": total_users})
+        
     return user_map
 
 def get_channel_name(channel_id):
     print(f"🔍 Getting channel info for {channel_id}...")
     params = {'channel': channel_id}
-    res = requests.get("https://slack.com/api/conversations.info", headers=HEADERS, params=params)
-    data = res.json()
-    check_response(data)
     
-    channel_name = data.get('channel', {}).get('name', channel_id)
-    print(f"📚 Channel name: {channel_name}")
-    return channel_name
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        res = requests.get("https://slack.com/api/conversations.info", headers=HEADERS, params=params)
+        data = res.json()
+        
+        if check_response(data):
+            channel_name = data.get('channel', {}).get('name', channel_id)
+            print(f"📚 Channel name: {channel_name}")
+            return channel_name
+        
+        retry_count += 1
+        if retry_count >= max_retries:
+            print(f"❌ Failed after {max_retries} attempts to get channel info")
+            return channel_id
 
 def fetch_channel_messages(channel_id, oldest):
     print(f"💬 Fetching messages from channel {channel_id} since {datetime.datetime.fromtimestamp(int(oldest)).date()}...")
@@ -83,19 +162,35 @@ def fetch_channel_messages(channel_id, oldest):
         if cursor:
             params['cursor'] = cursor
 
-        res = requests.get("https://slack.com/api/conversations.history", headers=HEADERS, params=params)
-        data = res.json()
-        check_response(data)
-
-        batch = data.get("messages", [])
-        total += len(batch)
-        print(f"  ➕ Fetched {len(batch)} messages (total: {total})")
-        messages.extend(batch)
-
-        cursor = data.get("response_metadata", {}).get("next_cursor")
-        if not data.get("has_more"):
+        max_retries = 5
+        retry_count = 0
+        success = False
+        
+        while retry_count < max_retries and not success:
+            res = requests.get("https://slack.com/api/conversations.history", headers=HEADERS, params=params)
+            data = res.json()
+            
+            if check_response(data):
+                success = True
+                batch = data.get("messages", [])
+                total += len(batch)
+                print(f"  ➕ Fetched {len(batch)} messages (total: {total})")
+                messages.extend(batch)
+                
+                cursor = data.get("response_metadata", {}).get("next_cursor")
+                if not data.get("has_more"):
+                    break
+            else:
+                retry_count += 1
+                if retry_count >= max_retries:
+                    print(f"❌ Failed after {max_retries} attempts to fetch messages")
+                    break
+        
+        if not success:
             break
-        time.sleep(1)  # Respect rate limits
+            
+        # Always add a delay between requests to prevent rate limiting
+        time.sleep(1.2)  # Slightly longer delay to be safer with rate limits
 
     if not messages:
         print("⚠️ No messages returned. Check channel ID, date range, or bot permissions.")
@@ -104,13 +199,26 @@ def fetch_channel_messages(channel_id, oldest):
 def fetch_thread(channel_id, thread_ts):
     print(f"🔁 Fetching thread replies for ts={thread_ts}...")
     params = {'channel': channel_id, 'ts': thread_ts}
-    res = requests.get("https://slack.com/api/conversations.replies", headers=HEADERS, params=params)
-    data = res.json()
-    check_response(data)
-
-    replies = data.get("messages", [])[1:]
-    print(f"  ↪️ {len(replies)} replies")
-    return replies
+    
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        res = requests.get("https://slack.com/api/conversations.replies", headers=HEADERS, params=params)
+        data = res.json()
+        
+        if check_response(data):
+            replies = data.get("messages", [])[1:]
+            print(f"  ↪️ {len(replies)} replies")
+            return replies
+        
+        retry_count += 1
+        if retry_count >= max_retries:
+            print(f"⚠️ Failed to fetch thread after {max_retries} attempts, skipping thread")
+            return []
+        
+        # Add delay between retries
+        time.sleep(1)
 
 def resolve_user(user_id, user_map):
     return user_map.get(user_id, f"<@{user_id}>")
@@ -198,6 +306,7 @@ def main():
     parser.add_argument("--output", "-o", help="Output file path (default: based on channel name)")
     parser.add_argument("--filter-jira-comments", action="store_true", help="Filter out Jira Cloud comment notifications")
     parser.add_argument("--json", help="Also save the intermediate JSON representation to this path")
+    parser.add_argument("--refresh-users", action="store_true", help="Force refresh user data instead of using cached data")
     args = parser.parse_args()
     
     try:
@@ -213,7 +322,10 @@ def main():
         else:
             output_filename = f"slack_export_{channel_name}.md"
         
-        user_map = fetch_user_map()
+        # Get user map (from cache or API)
+        user_map = fetch_user_map(force_refresh=args.refresh_users)
+        
+        # Fetch and structure messages
         messages = fetch_channel_messages(channel_id, oldest_timestamp)
         structured = structure_messages(messages, user_map, channel_id)
         
