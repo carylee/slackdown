@@ -166,6 +166,7 @@ def fetch_channel_messages(channel_id, oldest):
         retry_count = 0
         success = False
         
+        has_more = True
         while retry_count < max_retries and not success:
             res = requests.get("https://slack.com/api/conversations.history", headers=HEADERS, params=params)
             data = res.json()
@@ -178,8 +179,7 @@ def fetch_channel_messages(channel_id, oldest):
                 messages.extend(batch)
                 
                 cursor = data.get("response_metadata", {}).get("next_cursor")
-                if not data.get("has_more"):
-                    break
+                has_more = data.get("has_more", False)
             else:
                 retry_count += 1
                 if retry_count >= max_retries:
@@ -187,6 +187,10 @@ def fetch_channel_messages(channel_id, oldest):
                     break
         
         if not success:
+            break
+            
+        # If there are no more messages, break the outer loop
+        if not has_more:
             break
             
         # Always add a delay between requests to prevent rate limiting
