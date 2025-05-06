@@ -25,12 +25,19 @@ USER_DATA_PATH = Path(os.path.expanduser("~/.slackdown/users.json"))
 MAX_MSG_LENGTH = 2000
 JIRA_COMMENT_RE = re.compile(r"@?.+ commented on OH-\d+ .+")
 
-def check_response(resp):
+def check_response(resp, retry_count=0):
     if not resp.get("ok"):
         error = resp.get("error")
         if error == "ratelimited":
-            retry_after = int(resp.get("retry_after", 1))
-            print(f"⏰ Rate limited by Slack API. Waiting {retry_after} seconds...")
+            # Use the Slack-provided retry_after if available, otherwise use exponential backoff
+            slack_retry = resp.get("retry_after")
+            if slack_retry:
+                retry_after = int(slack_retry)
+            else:
+                # Start with 2 seconds, then exponentially increase: 2, 4, 8, 16, 32...
+                retry_after = 2 * (2 ** retry_count)
+                
+            print(f"⏰ Rate limited by Slack API. Waiting {retry_after} seconds (attempt {retry_count + 1})...")
             time.sleep(retry_after)
             return False
         print("❌ Slack API error:", error)
@@ -96,7 +103,7 @@ def fetch_user_map(force_refresh=False):
             res = requests.get("https://slack.com/api/users.list", headers=HEADERS, params=params)
             data = res.json()
             
-            if check_response(data):
+            if check_response(data, retry_count):
                 break
             
             retry_count += 1
@@ -137,7 +144,7 @@ def get_channel_name(channel_id):
         res = requests.get("https://slack.com/api/conversations.info", headers=HEADERS, params=params)
         data = res.json()
         
-        if check_response(data):
+        if check_response(data, retry_count):
             channel_name = data.get('channel', {}).get('name', channel_id)
             print(f"📚 Channel name: {channel_name}")
             return channel_name
@@ -171,7 +178,7 @@ def fetch_channel_messages(channel_id, oldest):
             res = requests.get("https://slack.com/api/conversations.history", headers=HEADERS, params=params)
             data = res.json()
             
-            if check_response(data):
+            if check_response(data, retry_count):
                 success = True
                 batch = data.get("messages", [])
                 total += len(batch)
@@ -211,7 +218,7 @@ def fetch_thread(channel_id, thread_ts):
         res = requests.get("https://slack.com/api/conversations.replies", headers=HEADERS, params=params)
         data = res.json()
         
-        if check_response(data):
+        if check_response(data, retry_count):
             replies = data.get("messages", [])[1:]
             print(f"  ↪️ {len(replies)} replies")
             return replies
