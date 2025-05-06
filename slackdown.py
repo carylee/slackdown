@@ -2,19 +2,25 @@ import requests
 import time
 import json
 import datetime
+import argparse
 from dotenv import load_dotenv
 import os
+import sys
+import re
+from pathlib import Path
 
 # Load .env config
 load_dotenv()
 SLACK_TOKEN = os.getenv('SLACK_TOKEN')
-CHANNEL_ID = os.getenv('CHANNEL_ID')
 
-if not SLACK_TOKEN or not CHANNEL_ID:
-    raise ValueError("SLACK_TOKEN and CHANNEL_ID must be set in your .env file.")
+if not SLACK_TOKEN:
+    raise ValueError("SLACK_TOKEN must be set in your .env file.")
 
 HEADERS = {'Authorization': f'Bearer {SLACK_TOKEN}'}
-OLDEST_TIMESTAMP = str(int(time.time() - 365 * 24 * 60 * 60 * 2))  # 2 years ago
+
+# Constants for JSON to Markdown conversion
+MAX_MSG_LENGTH = 2000
+JIRA_COMMENT_RE = re.compile(r"@?.+ commented on OH-\d+ .+")
 
 def check_response(resp):
     if not resp.get("ok"):
@@ -50,6 +56,17 @@ def fetch_user_map():
     if not user_map:
         print("⚠️ No users fetched. Check your token scopes (`users:read`).")
     return user_map
+
+def get_channel_name(channel_id):
+    print(f"🔍 Getting channel info for {channel_id}...")
+    params = {'channel': channel_id}
+    res = requests.get("https://slack.com/api/conversations.info", headers=HEADERS, params=params)
+    data = res.json()
+    check_response(data)
+    
+    channel_name = data.get('channel', {}).get('name', channel_id)
+    print(f"📚 Channel name: {channel_name}")
+    return channel_name
 
 def fetch_channel_messages(channel_id, oldest):
     print(f"💬 Fetching messages from channel {channel_id} since {datetime.datetime.fromtimestamp(int(oldest)).date()}...")
@@ -98,7 +115,7 @@ def fetch_thread(channel_id, thread_ts):
 def resolve_user(user_id, user_map):
     return user_map.get(user_id, f"<@{user_id}>")
 
-def structure_messages(messages, user_map):
+def structure_messages(messages, user_map, channel_id):
     structured = []
     print("🧱 Structuring messages...")
 
@@ -115,20 +132,103 @@ def structure_messages(messages, user_map):
         }
 
         if 'thread_ts' in msg and msg['ts'] == msg['thread_ts']:
-            entry['thread'] = fetch_thread(CHANNEL_ID, msg['thread_ts'])
+            entry['thread'] = fetch_thread(channel_id, msg['thread_ts'])
 
         structured.append(entry)
     return structured
 
-def main():
-    try:
-        user_map = fetch_user_map()
-        messages = fetch_channel_messages(CHANNEL_ID, OLDEST_TIMESTAMP)
-        structured = structure_messages(messages, user_map)
+# Functions from json_to_markdown.py
 
-        output_filename = f"slack_export_{CHANNEL_ID}.json"
+def format_timestamp(ts):
+    if ts is None:
+        return "unknown time"
+    try:
+        if isinstance(ts, float) or (isinstance(ts, str) and ts.replace(".", "", 1).isdigit()):
+            return datetime.datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+        return datetime.datetime.fromisoformat(str(ts)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(ts)
+
+def escape_md(text):
+    return text.replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+
+def truncate(text, max_len):
+    return text if len(text) <= max_len else text[:max_len] + "..."
+
+
+def is_jira_comment_message(msg):
+    return (
+        msg.get("user") == "Jira Cloud"
+        and JIRA_COMMENT_RE.fullmatch(msg.get("text", "").strip())
+    )
+
+def json_to_markdown(data, filter_jira_comments=False):
+    lines = ["## Slack Channel Transcript\n"]
+
+    for entry in data:
+        if filter_jira_comments and is_jira_comment_message(entry):
+            continue
+
+        user = entry.get("user", "Unknown")
+        time_str = format_timestamp(entry.get("timestamp"))
+        text = escape_md(entry.get("text", "").strip())
+        text = truncate(text, MAX_MSG_LENGTH)
+
+        lines.append(f"**{user}** ({time_str}):\n> {text}\n")
+
+        for reply in entry.get("thread", []):
+            reply_user = reply.get("user", "Unknown")
+            reply_time = format_timestamp(reply.get("timestamp"))
+            reply_text = escape_md(reply.get("text", "").strip())
+            reply_text = truncate(reply_text, MAX_MSG_LENGTH)
+
+            lines.append(f"  **{reply_user}** ({reply_time}):\n  > {reply_text}\n")
+
+        lines.append("---\n")
+
+    return "\n".join(lines)
+
+def calculate_oldest_timestamp(days):
+    return str(int(time.time() - days * 24 * 60 * 60))
+
+def main():
+    parser = argparse.ArgumentParser(description="Export Slack channel history to Markdown")
+    parser.add_argument("channel_id", help="Slack channel ID")
+    parser.add_argument("--days", type=int, default=365*2, help="Number of days to look back (default: 730 days/2 years)")
+    parser.add_argument("--output", "-o", help="Output file path (default: based on channel name)")
+    parser.add_argument("--filter-jira-comments", action="store_true", help="Filter out Jira Cloud comment notifications")
+    parser.add_argument("--json", help="Also save the intermediate JSON representation to this path")
+    args = parser.parse_args()
+    
+    try:
+        channel_id = args.channel_id
+        oldest_timestamp = calculate_oldest_timestamp(args.days)
+        
+        # Get channel name for the default output filename
+        channel_name = get_channel_name(channel_id)
+        
+        # Set output filename
+        if args.output:
+            output_filename = args.output
+        else:
+            output_filename = f"slack_export_{channel_name}.md"
+        
+        user_map = fetch_user_map()
+        messages = fetch_channel_messages(channel_id, oldest_timestamp)
+        structured = structure_messages(messages, user_map, channel_id)
+        
+        # Save JSON if requested
+        if args.json:
+            json_filename = args.json
+            with open(json_filename, 'w', encoding='utf-8') as f:
+                json.dump(list(reversed(structured)), f, indent=2, ensure_ascii=False)
+            print(f"💾 JSON data saved to {json_filename}")
+            
+        # Convert to markdown and save
+        markdown = json_to_markdown(list(reversed(structured)), filter_jira_comments=args.filter_jira_comments)
+        
         with open(output_filename, 'w', encoding='utf-8') as f:
-            json.dump(list(reversed(structured)), f, indent=2, ensure_ascii=False)
+            f.write(markdown)
 
         print(f"✅ Export complete! {len(structured)} top-level messages saved to {output_filename}")
 
